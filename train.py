@@ -29,6 +29,7 @@ from distributed import (
 )
 from op import conv2d_gradfix
 from non_leaking import augment, AdaptiveAugment
+from mask_generator import RandomMaskGenerator
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -84,12 +85,14 @@ def g_nonsaturating_loss(fake_pred):
     return loss
 
 
-def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
+def g_path_regularize(fake_img, latents, mean_path_length, mask, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
+    # Point 2
+    image_shape = fake_img.size(1) * fake_img.size(2) * fake_img.size(3)
     grad, = autograd.grad(
-        outputs=(fake_img * noise).sum(), inputs=latents, create_graph=True
+        outputs=(image_shape * (mask * fake_img * noise).sum((1, 2, 3)) / mask.sum((1, 2, 3))).sum(), inputs=latents, create_graph=True
     )
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
@@ -156,7 +159,29 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
-    sample_z = torch.randn(args.n_sample, args.latent, device=device)
+    random_mask_generator = RandomMaskGenerator(args.batch, args.size, device)
+
+    if get_rank() == 0:
+        sample_real_img = []
+        for _ in range(args.n_sample // args.batch + 1):
+            real_img = next(loader)
+            real_img = real_img.to(device)
+            sample_real_img.append(real_img)
+        sample_real_img = torch.cat(sample_real_img, dim=0)
+        sample_real_img = sample_real_img[:args.n_sample]
+
+        sample_z = torch.randn(args.n_sample, args.latent, device=device)
+        sample_mask = random_mask_generator(args.n_sample)
+
+        masked_sample_real_img = sample_real_img * (1 - sample_mask)
+        utils.save_image(
+            masked_sample_real_img,
+            f"sample/masked.png",
+            nrow=int(args.n_sample ** 0.5),
+            normalize=True,
+            range=(-1, 1),
+        )
+    synchronize()
 
     for idx in pbar:
         i = idx + args.start_iter
@@ -172,8 +197,9 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
+        mask = random_mask_generator()
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        fake_img, _ = generator(torch.cat((real_img, mask), dim=1), noise)
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
@@ -182,8 +208,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         else:
             real_img_aug = real_img
 
-        fake_pred = discriminator(fake_img)
-        real_pred = discriminator(real_img_aug)
+        fake_pred = discriminator(torch.cat((fake_img, mask), dim=1))
+        real_pred = discriminator(torch.cat((real_img_aug, mask), dim=1))
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict["d"] = d_loss
@@ -201,16 +227,21 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         d_regularize = i % args.d_reg_every == 0
 
         if d_regularize:
+            # Point 1
+            mask = random_mask_generator().detach()
+
             real_img.requires_grad = True
+            fixed_real_img = (real_img * (1 - mask)).detach()
+            new_real_img = real_img * mask
+            new_real_img += fixed_real_img
 
             if args.augment:
-                real_img_aug, _ = augment(real_img, ada_aug_p)
-
+                real_img_aug, _ = augment(new_real_img, ada_aug_p)
             else:
-                real_img_aug = real_img
+                real_img_aug = new_real_img
 
-            real_pred = discriminator(real_img_aug)
-            r1_loss = d_r1_loss(real_pred, real_img)
+            real_pred = discriminator(torch.cat((real_img_aug, mask), dim=1))
+            r1_loss = d_r1_loss(real_pred, new_real_img)
 
             discriminator.zero_grad()
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
@@ -223,12 +254,13 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(discriminator, False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
+        mask = random_mask_generator()
+        fake_img, _ = generator(torch.cat((real_img, mask), dim=1), noise)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
-        fake_pred = discriminator(fake_img)
+        fake_pred = discriminator(torch.cat((fake_img, mask), dim=1))
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
@@ -242,10 +274,14 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         if g_regularize:
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(path_batch_size, args.latent, args.mixing, device)
-            fake_img, latents = generator(noise, return_latents=True)
+            mask = random_mask_generator(path_batch_size)
+            fake_img, latents = generator(
+                torch.cat((real_img[:path_batch_size], mask), dim=1),
+                noise, return_latents=True
+            )
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
-                fake_img, latents, mean_path_length
+                fake_img, latents, mean_path_length, mask
             )
 
             generator.zero_grad()
@@ -305,7 +341,10 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             if i % 100 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    sample, _ = g_ema(
+                        torch.cat((sample_real_img, sample_mask), dim=1),
+                        [sample_z]
+                    )
                     utils.save_image(
                         sample,
                         f"sample/{str(i).zfill(6)}.png",
@@ -335,7 +374,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
     parser.add_argument("path", type=str, help="path to the lmdb dataset")
-    parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
+    parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
@@ -345,7 +384,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_sample",
         type=int,
-        default=64,
+        default=9,
         help="number of the samples generated during training",
     )
     parser.add_argument(
@@ -445,18 +484,22 @@ if __name__ == "__main__":
 
     if args.arch == 'stylegan2':
         from model import Generator, Discriminator
-
-    elif args.arch == 'swagan':
-        from swagan import Generator, Discriminator
+    else:
+        raise AttributeError
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, 1024, args.n_mlp,
+        bundle_channels=3, label_channels=1,
+        channel_multiplier=args.channel_multiplier
     ).to(device)
     discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier
+        args.size, bundle_channels=3, label_channels=1,
+        channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, 1024, args.n_mlp,
+        bundle_channels=3, label_channels=1,
+        channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)

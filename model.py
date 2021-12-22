@@ -388,21 +388,96 @@ class ToRGB(nn.Module):
         return out
 
 
+class NotResBlock(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super().__init__()
+
+        self.conv1 = ConvLayer(in_channel, in_channel, 3)
+        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
+
+    def forward(self, input):
+        out1 = self.conv1(input)
+        out2 = self.conv2(out1)
+        return out1, out2
+
+
+class ConditionalEncoder(nn.Module):
+    def __init__(self, size, channel_multiplier=2, total_channels=6):
+        super().__init__()
+
+        channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 256 * channel_multiplier,
+            128: 128 * channel_multiplier,
+            256: 64 * channel_multiplier,
+            512: 32 * channel_multiplier,
+            1024: 16 * channel_multiplier,
+        }
+
+        self.from_rgb = ConvLayer(total_channels, channels[size], 1)
+
+        self.log_size = int(math.log(size, 2))
+        in_channel = channels[size]
+        convs = []
+        for i in range(self.log_size, 2, -1):
+            out_channel = channels[2**(i - 1)]
+            convs.append(NotResBlock(in_channel, out_channel))
+            in_channel = out_channel
+        self.convs = nn.Sequential(*convs)
+
+        self.stddev_group = 4
+        self.stddev_feat = 1
+
+        self.final_conv = ConvLayer(in_channel, channels[4], 3)
+        self.final_linear = nn.Sequential(
+            EqualLinear(channels[4] * 4 * 4,
+                        2 * channels[4],
+                        activation='fused_lrelu'), )
+
+    def forward(self, input):
+        out2 = self.from_rgb(input)
+
+        residuals = []
+        log_size_list = list(range(self.log_size, 2, -1))
+        for i, log_size in enumerate(log_size_list):
+            out1, out2 = self.convs[i](out2)
+            residuals.append(out1)
+        out = out2
+        batch, channel, height, width = out.shape
+
+        out = self.final_conv(out)
+        residuals.append(out)
+        out = out.view(batch, -1)
+        out = self.final_linear(out)
+        out = nn.functional.dropout(out, 0.5)
+        residuals.reverse()
+
+        return out, residuals
+
+
 class Generator(nn.Module):
     def __init__(
         self,
         size,
         style_dim,
+        global_cond_emb_dim,
         n_mlp,
         channel_multiplier=2,
         blur_kernel=[1, 3, 3, 1],
         lr_mlp=0.01,
+        bundle_channels=5,
+        label_channels=5,
     ):
         super().__init__()
 
         self.size = size
+        self.bc = bundle_channels
 
         self.style_dim = style_dim
+        style_dim_plus_glocal_cond_emb_dim = style_dim + global_cond_emb_dim
 
         layers = [PixelNorm()]
 
@@ -429,9 +504,9 @@ class Generator(nn.Module):
 
         self.input = ConstantInput(self.channels[4])
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 3, style_dim_plus_glocal_cond_emb_dim, blur_kernel=blur_kernel
         )
-        self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
+        self.to_rgb1 = ToRGB(self.channels[4], style_dim_plus_glocal_cond_emb_dim, upsample=False)
 
         self.log_size = int(math.log(size, 2))
         self.num_layers = (self.log_size - 2) * 2 + 1
@@ -456,7 +531,7 @@ class Generator(nn.Module):
                     in_channel,
                     out_channel,
                     3,
-                    style_dim,
+                    style_dim_plus_glocal_cond_emb_dim,
                     upsample=True,
                     blur_kernel=blur_kernel,
                 )
@@ -464,15 +539,17 @@ class Generator(nn.Module):
 
             self.convs.append(
                 StyledConv(
-                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
+                    out_channel, out_channel, 3, style_dim_plus_glocal_cond_emb_dim, blur_kernel=blur_kernel
                 )
             )
 
-            self.to_rgbs.append(ToRGB(out_channel, style_dim))
+            self.to_rgbs.append(ToRGB(out_channel, style_dim_plus_glocal_cond_emb_dim))
 
             in_channel = out_channel
 
         self.n_latent = self.log_size * 2 - 2
+        self.cond_encoder = ConditionalEncoder(size=self.size, total_channels=bundle_channels + label_channels)
+        
 
     def make_noise(self):
         device = self.input.input.device
@@ -498,6 +575,7 @@ class Generator(nn.Module):
 
     def forward(
         self,
+        conditions,
         styles,
         return_latents=False,
         inject_index=None,
@@ -507,6 +585,10 @@ class Generator(nn.Module):
         noise=None,
         randomize_noise=True,
     ):
+        conditions_ = 0.5 * torch.ones_like(conditions)
+        conditions_[:, :self.bc] = conditions[:, :self.bc] * (1 - conditions[:, self.bc:self.bc + 1])
+        conditions_[:, self.bc:] = conditions[:, self.bc:] - 0.5
+
         if not input_is_latent:
             styles = [self.style(s) for s in styles]
 
@@ -546,22 +628,29 @@ class Generator(nn.Module):
 
             latent = torch.cat([latent, latent2], 1)
 
-        out = self.input(latent)
-        out = self.conv1(out, latent[:, 0], noise=noise[0])
+        cond_emb_global, cond_embs = self.cond_encoder(conditions_)
 
-        skip = self.to_rgb1(out, latent[:, 1])
+        out = self.input(latent)
+        out += cond_embs[0]
+        out = self.conv1(out, torch.cat((latent[:, 0], cond_emb_global), dim=1), noise=noise[0])
+
+        skip = self.to_rgb1(out, torch.cat((latent[:, 1], cond_emb_global), dim=1))
 
         i = 1
+        j = 1
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
-            out = conv1(out, latent[:, i], noise=noise1)
-            out = conv2(out, latent[:, i + 1], noise=noise2)
-            skip = to_rgb(out, latent[:, i + 2], skip)
+            out = conv1(out, torch.cat((latent[:, i], cond_emb_global), dim=1), noise=noise1)
+            out = out + cond_embs[j]
+            out = conv2(out, torch.cat((latent[:, i + 1], cond_emb_global), dim=1), noise=noise2)
+            skip = to_rgb(out, torch.cat((latent[:, i + 2], cond_emb_global), dim=1), skip)
 
             i += 2
+            j += 1
 
         image = skip
+        image = conditions[:, :self.bc] * (1 - conditions[:, self.bc:self.bc + 1]) + image * conditions[:, self.bc:self.bc + 1]
 
         if return_latents:
             return image, latent
@@ -637,7 +726,14 @@ class ResBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, size, channel_multiplier=2, blur_kernel=[1, 3, 3, 1]):
+    def __init__(
+        self,
+        size,
+        channel_multiplier=2,
+        blur_kernel=[1, 3, 3, 1],
+        bundle_channels=5,
+        label_channels=5,
+        ):
         super().__init__()
 
         channels = {
@@ -651,8 +747,8 @@ class Discriminator(nn.Module):
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
-
-        convs = [ConvLayer(3, channels[size], 1)]
+        self.bc = bundle_channels
+        convs = [ConvLayer(bundle_channels + label_channels, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
 
@@ -677,7 +773,10 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, input):
-        out = self.convs(input)
+        input_ = torch.ones_like(input)
+        input_[:, :self.bc] = input[:, :self.bc]
+        input_[:, self.bc:] = input[:, self.bc:] - 0.5
+        out = self.convs(input_)
 
         batch, channel, height, width = out.shape
         group = min(batch, self.stddev_group)
