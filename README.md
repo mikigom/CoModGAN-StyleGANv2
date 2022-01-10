@@ -43,3 +43,5 @@ Codes for Learned Perceptual Image Patch Similarity, LPIPS came from https://git
 To match FID scores more closely to tensorflow official implementations, I have used FID Inception V3 implementations in https://github.com/mseitzer/pytorch-fid
 
 @rosinality's StyleGANv2 Code: https://github.com/rosinality/stylegan2-pytorch
+
+@zsyzzsoft's CoModGAN Code (Official): https://github.com/zsyzzsoft/co-mod-gan
