@@ -30,7 +30,7 @@ You should change your size (--size 256 for example) if you train with another d
 
 ## Samples
 
-![Sample with truncation](sample/test_sample.png)
+![Sample with truncation](sample/test_samples.png)
 
 Sample from FFHQ. At 180,000 iterations.
 
