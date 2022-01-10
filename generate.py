@@ -14,6 +14,7 @@ from mask_generator import RandomMaskGenerator
 def generate(args, g_ema, device, mean_latent, loader, random_mask_generator):
     loader = sample_data(loader)
 
+    samples = []
     with torch.no_grad():
         g_ema.eval()
         for i in tqdm(range(args.pics)):
@@ -26,15 +27,20 @@ def generate(args, g_ema, device, mean_latent, loader, random_mask_generator):
                 torch.cat((real_img, sample_mask), dim=1), [sample_z],
                 truncation=args.truncation, truncation_latent=mean_latent
             )
-
             masked_image = real_img * (1 - sample_mask) + torch.ones_like(real_img) * sample_mask
-            utils.save_image(
-                torch.cat((masked_image, sample), dim=0),
-                f"sample/test_{str(i).zfill(6)}.png",
-                nrow=1,
-                normalize=True,
-                range=(-1, 1),
-            )
+
+            samples.append(masked_image)
+            samples.append(sample)
+
+        samples = torch.cat(samples, dim=0)
+
+        utils.save_image(
+            samples,
+            f"sample/test_samples.png",
+            nrow=int(args.pics**(1/2)),
+            normalize=True,
+            range=(-1, 1),
+        )
 
 
 if __name__ == "__main__":
@@ -53,7 +59,7 @@ if __name__ == "__main__":
         help="number of samples to be generated for each image",
     )
     parser.add_argument(
-        "--pics", type=int, default=20, help="number of images to be generated"
+        "--pics", type=int, default=16, help="number of images to be generated"
     )
     parser.add_argument("--truncation", type=float, default=1, help="truncation ratio")
     parser.add_argument(
